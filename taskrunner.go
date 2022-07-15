@@ -2,26 +2,60 @@ package taskrunner
 
 import (
 	"context"
-	"sync"
-
 	"github.com/pkg/errors"
 	"github.com/satori/go.uuid"
+	"sync"
 )
 
 var (
-	ErrorTaskManagerIsHalted = errors.New("task manager is shutting down")
+	ErrorKeyAlreadyExistInMeta = errors.New("key already exist in meta")
+	ErrorKeyDidNotExistInMeta  = errors.New("key is not present in meta")
 )
 
-type runnable func(ctx context.Context, meta Task)
+type runnable func(ctx context.Context, meta *Task)
 
-type taskManager struct {
+type Task struct {
+	sync.RWMutex
+	cancelFunc context.CancelFunc
+	source     runnable
+	meta       map[string]interface{}
+}
+
+func (m *Task) AddMeta(key string, val interface{}) error {
+	m.Lock()
+	defer m.Unlock()
+	if _, ok := m.meta[key]; ok {
+		return ErrorKeyAlreadyExistInMeta
+	}
+	m.meta[key] = val
+
+	return nil
+}
+
+func (m *Task) RemoveMeta(key string) error {
+	m.Lock()
+	defer m.Unlock()
+	if _, ok := m.meta[key]; !ok {
+		return ErrorKeyDidNotExistInMeta
+	}
+	delete(m.meta, key)
+	return nil
+}
+
+func (m *Task) Cancel() {
+	m.Lock()
+	defer m.Unlock()
+	m.cancelFunc()
+}
+
+type TaskManager struct {
 	sync.RWMutex
 	count  int
 	open   bool
-	ledger map[string]Task
+	ledger map[string]*Task
 }
 
-func (tm *taskManager) addTask(cancelFunc context.CancelFunc, taskid string, fn runnable) Task {
+func (tm *TaskManager) addTask(cancelFunc context.CancelFunc, taskid string, fn runnable) *Task {
 	tm.Lock()
 	defer tm.Unlock()
 	tm.count++
@@ -29,79 +63,54 @@ func (tm *taskManager) addTask(cancelFunc context.CancelFunc, taskid string, fn 
 	return tm.ledger[taskid]
 }
 
-func (tm *taskManager) done(taskid string) {
+func (tm *TaskManager) done(taskid string) {
 	tm.Lock()
 	defer tm.Unlock()
 	tm.count--
 	delete(tm.ledger, taskid)
 }
 
-func (tm *taskManager) GO(ctx context.Context, fn runnable) (taskId string, err error) {
-	if tm.open {
-		taskId = uuid.NewV4().String()
-		go func() {
-			ctx, cancel := context.WithCancel(ctx)
-			fn(ctx, tm.addTask(cancel, taskId, fn))
-			tm.done(taskId)
-		}()
-		return
-	}
-	return taskId, ErrorTaskManagerIsHalted
+func (tm *TaskManager) GO(ctx context.Context, fn runnable) string {
+	taskid := uuid.NewV4().String()
+	go func() {
+		ctx, cancel := context.WithCancel(ctx)
+		fn(ctx, tm.addTask(cancel, taskid, fn))
+		tm.done(taskid)
+	}()
+	return taskid
 }
 
-func (tm *taskManager) IsOpen() bool {
+func (tm *TaskManager) IsOpen() bool {
 	tm.RLock()
 	defer tm.RUnlock()
 	return tm.open
 }
 
-func (tm *taskManager) FindFromMetaKey(key string) (tasks []Task) {
+func (tm *TaskManager) FindFromMeta(key string) *Task {
 	tm.RLock()
 	defer tm.RUnlock()
 
-	for _, task := range tm.ledger {
-		if _, ok := task.GetMeta(key); ok {
-			tasks = append(tasks, task)
+	for lkey, led := range tm.ledger {
+		led.RLock()
+		if _, ok := led.meta[key]; ok {
+			led.RUnlock()
+			return tm.ledger[lkey]
 		}
+		led.RUnlock()
 	}
-	return tasks
+	return nil
 }
 
-func (tm *taskManager) CancelTaskFromMetaKey(key string) (count int, err error) {
-	if !tm.IsOpen() {
-		return count, ErrorTaskManagerIsHalted
+func (tm *TaskManager) CancelTaskFromMetaKey(key string) {
+	if task := tm.FindFromMeta(key); task != nil {
+		task.Cancel()
 	}
-	tm.Lock()
-	defer tm.Unlock()
-
-	for _, task := range tm.ledger {
-		if _, ok := task.GetMeta(key); ok {
-			task.Cancel()
-			count++
-		}
-	}
-	return
 }
 
-func (tm *taskManager) RestartTasksFromMetaKey(key string) (count int, err error) {
-	if !tm.IsOpen() {
-		return count, ErrorTaskManagerIsHalted
+func (tm *TaskManager) RestartTaskFromMetaKey(key string) {
+	if task := tm.FindFromMeta(key); task != nil {
+		source := task.source
+		task.Cancel()
+		tm.GO(context.TODO(), source)
 	}
-	tm.RLock()
-	defer tm.RUnlock()
-	for _, task := range tm.ledger {
-		if _, ok := task.GetMeta(key); ok {
-			source := task.getSource()
-			task.Cancel()
-			tm.GO(context.TODO(), source)
-			count++
-		}
-	}
-	return
-}
-
-func (tm *taskManager) GetTasksCount() int {
-	tm.RLock()
-	tm.RUnlock()
-	return tm.count
 }
